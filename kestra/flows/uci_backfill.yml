@@ -1,43 +1,48 @@
 id: uci_backfill
 namespace: usfq.pset2
 description: |
-  Backfill de la historia disponible (abril-septiembre 2005). Recorre los meses en orden
-  cronológico y llama al flujo de ingesta mensual para cada uno, de a uno por vez.
-  Como la ingesta es idempotente, el backfill se puede repetir completo o para un solo mes
-  sin duplicar datos.
-
+  Backfill de la historia disponible (abril-septiembre 2005): carga los 6 meses en orden
+  cronológico con la misma imagen y el mismo script de la ingesta mensual. Es idempotente:
+  repetirlo completo o para un mes no duplica datos.
 labels:
   project: anticipar-mora
   layer: raw
-
+concurrency:
+  limit: 1
+  behavior: QUEUE
 inputs:
   - id: months
-    type: ARRAY
-    itemType: STRING
-    description: Meses a (re)cargar, YYYY-MM
-    defaults:
-      - "2005-04"
-      - "2005-05"
-      - "2005-06"
-      - "2005-07"
-      - "2005-08"
-      - "2005-09"
-
+    type: STRING
+    defaults: "2005-04 2005-05 2005-06 2005-07 2005-08 2005-09"
+    description: Meses a (re)cargar, separados por espacio (YYYY-MM)
 tasks:
-  - id: for_each_month
-    type: io.kestra.plugin.core.flow.ForEach
-    values: "{{ inputs.months }}"
-    concurrencyLimit: 1   # secuencial: respeta el orden cronológico
-    tasks:
-      - id: load_month
-        type: io.kestra.plugin.core.flow.Subflow
-        namespace: usfq.pset2
-        flowId: uci_ingest_monthly
-        inputs:
-          statement_month: "{{ taskrun.value }}"
-        wait: true
-        transmitFailed: true   # si un mes falla, el backfill falla y se ve qué mes
-
-  - id: summary
+  - id: backfill_months
+    type: io.kestra.plugin.scripts.shell.Commands
+    containerImage: pset2-ingesta:1.0
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      pullPolicy: NEVER
+    env:
+      SNOWFLAKE_ACCOUNT: "{{ secret('SNOWFLAKE_ACCOUNT') }}"
+      SNOWFLAKE_USER: "{{ secret('SNOWFLAKE_USER') }}"
+      SNOWFLAKE_PRIVATE_KEY: "{{ secret('SNOWFLAKE_PRIVATE_KEY') }}"
+      SNOWFLAKE_PRIVATE_KEY_PATH: /tmp/sf_key.p8
+      SNOWFLAKE_ROLE: "{{ secret('SNOWFLAKE_ROLE') }}"
+      SNOWFLAKE_WAREHOUSE: "{{ secret('SNOWFLAKE_WAREHOUSE') }}"
+      SNOWFLAKE_DATABASE: "{{ secret('SNOWFLAKE_DATABASE') }}"
+    commands:
+      - printf '%s\n' "$SNOWFLAKE_PRIVATE_KEY" > /tmp/sf_key.p8
+      - curl -sL -o /tmp/uci.xls https://raw.githubusercontent.com/jphall663/interpretable_machine_learning_with_python/master/default_of_credit_card_clients.xls || python -c "import requests;open('/tmp/uci.xls','wb').write(requests.get('https://raw.githubusercontent.com/jphall663/interpretable_machine_learning_with_python/master/default_of_credit_card_clients.xls').content)"
+      - for m in {{ inputs.months }}; do python /app/ingest_uci.py --statement-month $m --target snowflake --local-file /tmp/uci.xls --execution-id {{ execution.id }} || exit 1; done
+    timeout: PT30M
+    retry:
+      type: exponential
+      interval: PT30S
+      maxInterval: PT10M
+      maxAttempts: 4
+      warningOnRetry: true
+errors:
+  - id: log_failure
     type: io.kestra.plugin.core.log.Log
-    message: "Backfill terminado para {{ inputs.months | length }} meses: {{ inputs.months }}"
+    level: ERROR
+    message: "FALLÓ el backfill (execution {{ execution.id }})."

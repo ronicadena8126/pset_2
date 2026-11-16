@@ -9,3 +9,4 @@ __pycache__/
 .ivy*/
 *.xls
 .venv/
+.env_encoded

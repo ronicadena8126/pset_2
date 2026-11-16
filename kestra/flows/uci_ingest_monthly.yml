@@ -40,14 +40,16 @@ tasks:
     env:
       SNOWFLAKE_ACCOUNT: "{{ secret('SNOWFLAKE_ACCOUNT') }}"
       SNOWFLAKE_USER: "{{ secret('SNOWFLAKE_USER') }}"
-      SNOWFLAKE_PASSWORD: "{{ secret('SNOWFLAKE_PASSWORD') }}"
+      SNOWFLAKE_PRIVATE_KEY: "{{ secret('SNOWFLAKE_PRIVATE_KEY') }}"
+      SNOWFLAKE_PRIVATE_KEY_PATH: /tmp/sf_key.p8
       SNOWFLAKE_ROLE: "{{ secret('SNOWFLAKE_ROLE') }}"
       SNOWFLAKE_WAREHOUSE: "{{ secret('SNOWFLAKE_WAREHOUSE') }}"
       SNOWFLAKE_DATABASE: "{{ secret('SNOWFLAKE_DATABASE') }}"
       RAW_SCHEMA: RAW
       KESTRA_EXECUTION_ID: "{{ execution.id }}"
     commands:
-      - python /app/ingest_uci.py --statement-month {{ render(vars.statement_month) }} --target snowflake
+      - printf '%s\n' "$SNOWFLAKE_PRIVATE_KEY" > /tmp/sf_key.p8
+      - python /app/ingest_uci.py --statement-month {{ render(vars.statement_month) }} --target snowflake --source-url https://raw.githubusercontent.com/jphall663/interpretable_machine_learning_with_python/master/default_of_credit_card_clients.xls
     timeout: PT20M
     # Por qué así: la fuente es un archivo estático en el servidor de UCI, que falla por
     # caídas o throttling HTTP de minutos, no de segundos; y Snowflake puede tardar en

@@ -74,13 +74,3 @@ errors:
     level: ERROR
     message: "FALLÓ la transformación (execution {{ execution.id }}). Revisar dbt_build / spark_obt."
 
-triggers:
-  - id: after_ingestion
-    type: io.kestra.plugin.core.trigger.Flow
-    conditions:
-      - type: io.kestra.plugin.core.condition.ExecutionStatus
-        in:
-          - SUCCESS
-      - type: io.kestra.plugin.core.condition.ExecutionFlow
-        namespace: usfq.pset2
-        flowId: uci_ingest_monthly
