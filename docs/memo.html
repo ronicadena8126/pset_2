@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="es"><head><meta charset="utf-8">
+<title>PSet 2 — Pipeline de datos end-to-end</title>
+<style>
+@page { size: A4; margin: 16mm 16mm 16mm 16mm; }
+body { font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; font-size: 9.6pt; line-height: 1.38; color: #1f2933; }
+h1 { font-size: 15pt; margin: 0 0 2px 0; }
+.sub { color: #52606d; font-size: 9pt; margin-bottom: 8px; }
+h2 { font-size: 11.5pt; margin: 12px 0 4px 0; color: #102a43; border-bottom: 1px solid #d9e2ec; padding-bottom: 2px; }
+h3 { font-size: 10pt; margin: 8px 0 3px 0; }
+p { margin: 3px 0 5px 0; text-align: justify; }
+ul { margin: 2px 0 6px 0; padding-left: 16px; } li { margin-bottom: 1px; }
+table { border-collapse: collapse; width: 100%; margin: 4px 0 8px 0; font-size: 8.4pt; }
+th, td { border: 1px solid #cbd2d9; padding: 3px 5px; vertical-align: top; text-align: left; }
+th { background: #f0f4f8; }
+code { font-family: Menlo, Consolas, monospace; font-size: 8.3pt; background: #f5f7fa; padding: 0 2px; }
+img { display: block; margin: 4px auto; }
+.cap { text-align: center; font-size: 8pt; color: #52606d; margin-top: 0; }
+.box { background: #f5f7fa; border-left: 3px solid #7aa7e8; padding: 4px 8px; margin: 5px 0; }
+.pb { page-break-before: always; }
+pre { font-size: 7.6pt; background: #f5f7fa; padding: 6px; white-space: pre-wrap; }
+</style></head><body>
+
+<h1>PSet #2: Pipeline de datos end-to-end para anticipar la mora en tarjetas de crédito</h1>
+<div class="sub">Ronnie Almeida Cadena · Fundamentos de Ciencia de Datos (MSDS 6003) · USFQ · 15 de noviembre de 2026</div>
+
+<p>Este documento describe el pipeline que alimenta el proyecto del PSet 1: predecir, con un mes de anticipación, qué clientes de tarjeta de crédito no pagarán su próxima cuota. La unidad de predicción es el <b>cliente</b> observado al cierre de septiembre de 2005, y el target es el impago de octubre de 2005. Todo el diseño apunta a producir esa tabla sin fuga de datos y con decisiones de limpieza trazables.</p>
+
+<h2>1. Arquitectura</h2>
+<img src="img/architecture.png" style="width:100%">
+<p class="cap">Figura 1. Infraestructura implementada. La parte local se levanta con <code>docker-compose.yml</code>: Kestra con Postgres, Spark master y worker, y dbt. El almacenamiento es Snowflake.</p>
+<p><b>Flujo de datos.</b> Kestra descarga la fuente y carga una partición mensual en <code>RAW</code>. Cuando la ingesta termina con éxito, un <i>Flow trigger</i> lanza <code>pipeline_transform</code>, que ejecuta <code>dbt build</code>. dbt construye en orden <code>BRONZE</code> (vistas tipadas), <code>SILVER</code> (limpieza) y <code>GOLD</code> (estrella) y corre los tests. Si los tests pasan, Spark lee Gold, arma la OBT, valida los joins y la escribe en el esquema <code>OBT</code>. Si un test falla, Spark no corre, así que nunca se construye una OBT sobre datos que no pasaron calidad.</p>
+<p><b>Decisiones.</b> (1) Raw separado de Bronze: Raw guarda lo que llegó, con <code>_INGESTED_AT</code>, <code>_EXECUTION_ID</code> y <code>_SOURCE_URL</code>, para poder auditar y re-procesar sin volver a descargar. (2) Las transformaciones se ejecutan dentro de Snowflake (ELT) con dbt, que ordena las dependencias mediante <code>source()</code> y <code>ref()</code>. (3) Spark se usa solo donde aporta: el pivot cliente × mes y las validaciones. (4) Las credenciales viven en <code>.env</code> y en los secretos de Kestra (<code>SECRET_*</code>), nunca en el repositorio.</p>
+
+<h2>2. Ingesta con Kestra (Raw)</h2>
+<table>
+<tr><th style="width:20%">Aspecto</th><th>Implementación</th></tr>
+<tr><td>Fuente</td><td>UCI <i>Default of Credit Card Clients</i>: un archivo .xls público con 30.000 clientes y 25 columnas. Contiene seis meses de historia (abr–sep 2005) en formato ancho (<code>PAY_0..6</code>, <code>BILL_AMT1..6</code>, <code>PAY_AMT1..6</code>) y el target.</td></tr>
+<tr><td>Granularidad</td><td>Cliente × mes de estado de cuenta. Cada ejecución carga <b>una partición mensual</b>, simulando el corte que entregaría el core de tarjetas. Para el mes 2005-09 se toman <code>PAY_0</code>, <code>BILL_AMT1</code> y <code>PAY_AMT1</code>, y así sucesivamente hasta 2005-04. Los valores no se alteran; solo se selecciona la columna del mes.</td></tr>
+<tr><td>Tablas Raw</td><td><code>STATEMENTS</code> (180.000 filas), <code>CLIENTS_SNAPSHOT</code> (180.000, una copia de los atributos por cada mes cargado) y <code>DEFAULT_LABELS</code> (30.000). Las etiquetas solo se cargan con la partición 2005-09, porque el impago de octubre recién se conoce después de ese cierre. Así Raw ya respeta la línea temporal.</td></tr>
+<tr><td>Trigger y frecuencia</td><td><i>Schedule</i> <code>0 6 2 * *</code> (America/Guayaquil): el día 2 de cada mes a las 06:00 se carga el mes anterior (<code>trigger.date − 1 mes</code>). La frecuencia sigue al proceso de negocio: el estado de cuenta se cierra una vez al mes y cobranza arma su lista a inicios de mes. <code>concurrency: limit 1</code> evita dos cargas simultáneas.</td></tr>
+<tr><td>Proceso de carga</td><td>Kestra corre la imagen del proyecto <code>pset2-ingesta:1.0</code> (Dockerfile del repo, Docker runner con <code>pullPolicy: NEVER</code>), que ejecuta <code>ingest_uci.py</code>: descarga, valida el esquema (columnas esperadas, 30.000 filas, IDs únicos), extrae la partición y la carga con <code>write_pandas</code>. La carga es <b>idempotente</b>: <code>DELETE</code> de la partición + <code>INSERT</code> dentro de una transacción. Un reintento o un backfill repetido no duplica filas; lo verificamos recargando 2005-09 dos veces y obtuvimos 180.000 filas, no 210.000.</td></tr>
+<tr><td>Errores y retries</td><td><code>retry: exponential</code> con 4 intentos (30 s → 1 m → 2 m → 4 m, tope de 10 min y 1 h en total) porque la fuente (servidor de UCI) falla por caídas de minutos, no de segundos, y Snowflake tarda en reanudar el warehouse suspendido; un reintento inmediato chocaría con la misma caída. <code>timeout</code> de 20 min. El bloque <code>errors</code> registra la partición y el <code>execution.id</code>. Como la carga es transaccional, una falla deja la partición previa intacta. Un cambio de esquema de la fuente aborta con un error explícito: reintentarlo no lo arreglaría.</td></tr>
+<tr><td>Backfill</td><td>El flujo <code>uci_backfill</code> recibe una lista de meses (por defecto 2005-04 a 2005-09) y llama, con <code>ForEach</code> y <code>concurrencyLimit: 1</code>, al subflujo de ingesta para cada mes, en orden cronológico y esperando el resultado. Si un mes falla, el backfill falla e indica cuál fue. También se puede recargar un solo mes pasando el input <code>statement_month</code>.</td></tr>
+</table>
+
+<h2>3. Calidad y limpieza de datos</h2>
+<p>El perfilado se hizo sobre los 30.000 clientes y los 180.000 estados de cuenta, antes de transformar. <b>Completitud:</b> 0 nulos en las 25 columnas (750.000 celdas), así que el problema no es la ausencia de datos sino su <b>codificación</b> y <b>consistencia</b>. <b>Validez de rangos:</b> edad entre 21 y 79, cupo entre 10.000 y 1.000.000 NT$, pagos ≥ 0 (todo correcto). El target tiene una tasa de impago del 22,12%. Toda la limpieza está implementada en Silver con dbt.</p>
+<table>
+<tr><th style="width:15%">Problema (dimensión)</th><th style="width:22%">Evidencia</th><th style="width:22%">Acción</th><th>Justificación</th></tr>
+<tr><td>Atributos de cliente repetidos (unicidad)</td><td>Raw tiene 180.000 filas de <code>CLIENTS_SNAPSHOT</code> para 30.000 IDs (6 copias por cliente, una por mes cargado).</td><td>Conservar el snapshot más reciente por ID (<code>row_number</code> por <code>snapshot_month</code> e <code>_ingested_at</code> descendentes).</td><td>Es la última versión conocida del cliente al momento de predecir (SCD1). El test <code>row_count_equals_model</code> garantiza que no se pierde ningún cliente.</td></tr>
+<tr><td>EDUCATION fuera del catálogo (validez)</td><td>345 clientes (1,15%) con códigos 0, 5 o 6, que no están documentados en la fuente.</td><td>Reasignar al código 4, "Otros/Desconocido", conservar el valor original y marcar <code>is_education_imputed</code>.</td><td>Ninguno de esos códigos tiene significado propio y el volumen es bajo. Eliminarlos sesgaría la muestra: su tasa de impago es de 7,5%, frente a 22,1% en el total.</td></tr>
+<tr><td>MARRIAGE = 0 (validez)</td><td>54 clientes (0,18%).</td><td>Reasignar a 3, "Otro", con bandera.</td><td>Mismo criterio. Además, la variable queda fuera de la OBT por equidad (decisión del PSet 1).</td></tr>
+<tr><td>PAY_STATUS −2 y 0 no documentados (validez)</td><td>13,6% de los estados de cuenta tienen −2 y 53,3% tienen 0; la documentación oficial solo define −1 y 1..9.</td><td><b>No imputar.</b> Se interpretan según las aclaraciones del autor (−2 = sin consumo, 0 = pago mínimo) y se derivan <code>months_delay = max(pay_status, 0)</code> e <code>is_delinquent</code>.</td><td>Son dos tercios de los datos y llevan información (estar en crédito rotativo no es lo mismo que estar al día). Convertirlos en "al día" o en nulos destruiría esa señal.</td></tr>
+<tr><td>Codificación inconsistente entre meses (consistencia)</td><td>El valor PAY_STATUS = 1 aparece 3.688 veces en sep-2005 y solo 28, 4, 2, 0 y 0 veces en ago–abr.</td><td>Conservar y documentar. Las features usan <code>is_delinquent</code> y <code>months_delay</code>, que no dependen de distinguir el 1.</td><td>Indica que la fuente cambió de codificación en el mes más reciente. No hay forma de reconstruir el valor verdadero; se registra como limitación.</td></tr>
+<tr><td>Saldo negativo (precisión)</td><td>3.932 estados de cuenta (2,18%) en 1.930 clientes (6,4%) con <code>BILL_AMT</code> &lt; 0.</td><td>Conservar el valor y marcar <code>has_credit_balance</code>.</td><td>Es un saldo a favor (sobrepago), un estado válido en negocio. Truncarlo a 0 cambiaría la utilización y la relación de pago.</td></tr>
+<tr><td>Saldo mayor al cupo (precisión)</td><td>8.274 estados de cuenta (4,6%) en 3.931 clientes (13,1%); en 59 clientes el saldo supera 2 veces el cupo.</td><td>Conservar el valor y marcar <code>is_overlimit</code> / <code>is_extreme_overlimit</code>; la utilización se calcula sin tope.</td><td>Intereses y cargos pueden superar el cupo, y el sobregiro es una señal de riesgo que el modelo debe ver. No hay evidencia de que sea un error de captura.</td></tr>
+<tr><td>Estado de pago vs. saldo (consistencia)</td><td>2.068 meses (1,15%) con atraso ≥ 1 pero saldo ≤ 0, y 9.425 meses (5,2%) con "sin consumo" (−2) pero saldo &gt; 0.</td><td>Conservar y marcar <code>flag_delay_without_balance</code> y <code>flag_no_use_with_balance</code>; en la OBT se resumen en <code>n_inconsistent_months_6m</code>.</td><td>No sabemos cuál de los dos campos es el erróneo. Marcarlos permite medir en el EDA si esos registros se comportan distinto, en lugar de decidir a ciegas.</td></tr>
+<tr><td>Cuentas inactivas con impago (precisión del target)</td><td>795 clientes (2,65%) con saldo y pago en 0 los seis meses; aun así, su tasa de impago es de 37,6%.</td><td>Conservar y marcar <code>is_inactive_6m</code>.</td><td>Es un posible ruido de etiqueta, pero también podría ser deuda fuera de la ventana. Se decidirá en el modelado con evidencia, no aquí.</td></tr>
+<tr><td>Registros idénticos con distinto ID (unicidad)</td><td>35 filas idénticas en las 24 variables (70 en grupos), de las cuales 60 son cuentas inactivas.</td><td>Conservar.</td><td>Los IDs son distintos y casi todos son cuentas sin movimiento, que naturalmente coinciden en ceros. No hay evidencia de duplicación técnica.</td></tr>
+<tr><td>Relación de pago indefinida (completitud derivada)</td><td><code>payment_ratio</code> es nulo en 49.439 meses (27,5%): 30.000 por ser el primer mes y 19.439 por tener saldo previo ≤ 0.</td><td>Dejar en nulo (no imputar con 0).</td><td>Dividir por un saldo ≤ 0 no tiene sentido. La imputación se decidirá en el pipeline de features.</td></tr>
+</table>
+
+<h2>4. Transformaciones y modelado (Bronze → Silver → Gold)</h2>
+<p><b>Bronze</b> (vistas): copia 1:1 de Raw con tipos explícitos (<code>numeric(14,2)</code>, <code>date</code>), nombres en snake_case y metadatos de carga. No aplica ninguna regla de negocio, de modo que cualquier decisión de limpieza se puede rehacer desde aquí. <b>Silver</b> (tablas): aplica la sección 3. Deduplica snapshots y particiones re-cargadas, recodifica categorías con banderas y deriva <code>months_delay</code>, <code>is_delinquent</code>, <code>utilization_ratio</code> y <code>payment_ratio</code> (pago del mes sobre el saldo del mes anterior, con <code>lag</code>). <b>Gold</b>: esquema estrella.</p>
+<img src="img/star_schema.png" style="width:78%">
+<p class="cap">Figura 2. Modelo dimensional en Gold: dos hechos que comparten las dimensiones cliente y mes.</p>
+<p><b>Grano.</b> <code>fct_monthly_statement</code> tiene <b>un estado de cuenta por cliente y por mes</b> (180.000 filas). Es el evento atómico que genera el negocio, y de él salen todas las features de comportamiento. El target tiene otro grano (uno por cliente y mes de observación), así que se modela en un segundo hecho, <code>fct_default_outcome</code> (30.000 filas). Ponerlo en el primer hecho lo repetiría seis veces y facilitaría usarlo por error como feature de meses anteriores. <code>dim_month</code> incluye <code>months_to_label</code>, que hace explícita la distancia temporal al target y luego ordena el pivot de Spark.</p>
+<p><b>Tests (72 nodos, todos OK).</b> Además de <code>not_null</code>, <code>unique</code>, <code>relationships</code> (hechos → 3 dimensiones) y <code>accepted_values</code>, el proyecto incluye tests que validan <b>reglas del problema</b>: grano único cliente × mes; exactamente 6 meses de historia por cliente; <b>anti-fuga</b> (ningún estado de cuenta tiene un mes ≥ al mes del target); tasa de impago plausible (15–30%); consistencia entre <code>is_delinquent</code> y el catálogo de estados de pago; conteos que la limpieza no puede alterar (<code>row_count_equals_model</code>); pagos ≥ 0, cupo &gt; 0 y edad entre 18 y 100.</p>
+
+<h2>5. Spark y OBT</h2>
+<p><code>build_obt.py</code> lee las cinco tablas Gold (conector spark-snowflake) y aplica tres pasos. (1) Une el hecho mensual con <code>dim_month</code> y <code>dim_payment_status</code> mediante <i>broadcast join</i>, porque son tablas de 7 y 12 filas. (2) Hace el pivot cliente × mes con los valores fijos 1..6 de <code>months_to_label</code>, generando <code>pay_status_m1..m6</code>, <code>bill_amt_m*</code>, <code>pay_amt_m*</code> y <code>util_m*</code> (m1 = septiembre). (3) Calcula agregados de 6 y 3 meses: máximo atraso, meses en mora, utilización media y máxima, relación de pago, meses sobregirados e inconsistencias. Luego une a <code>dim_customer</code> (sin <code>sex</code> ni <code>marital_status</code>, por equidad) y a <code>fct_default_outcome</code>.</p>
+<p><b>Grano de la OBT:</b> una fila por cliente observado al cierre de sep-2005, con el target de oct-2005. Resultado: 30.000 filas × 53 columnas en <code>OBT.OBT_CUSTOMER_DEFAULT</code>.</p>
+<div class="box"><b>Validación de los joins</b> (si alguna falla, el job termina con error y no escribe): filas OBT = filas <code>dim_customer</code> = filas <code>fct_default_outcome</code> = 30.000; <code>customer_id</code> distintos = 30.000; 0 clientes con meses faltantes en el pivot; 0 clientes sin target; Σ <code>bill_amt</code> antes y después = 8.095.850.136 (los joins no duplicaron ni perdieron estados de cuenta); tasa de impago antes y después = 0,2212.</div>
+<p><b>¿Estrella u OBT?</b> La <b>estrella</b> es la fuente de verdad del proyecto. Se usa para el análisis exploratorio y para el monitoreo (por ejemplo, tasa de mora por mes o tramo de edad, o drift de la utilización mes a mes), para auditar la equidad (las dimensiones conservan sexo y estado civil) y para recalcular features con otras ventanas sin re-ingestar. La <b>OBT</b> es la vista de consumo del modelo: una fila por unidad de predicción, sin joins en tiempo de entrenamiento o scoring, y con el mismo esquema para entrenar y para servir la API, lo que evita el <i>training-serving skew</i>. Si cambia la definición de una feature, se cambia en Gold o en Spark y la OBT se regenera.</p>
+
+<h2>6. Batch vs. streaming</h2>
+<p><b>Batch es suficiente.</b> El dato se genera una vez al mes, con el cierre del estado de cuenta, y la decisión también es mensual: cobranza recibe una lista priorizada el primer día hábil y llama antes del vencimiento. El horizonte de predicción es de un mes, así que una latencia de horas (la carga del día 2 a las 06:00) no cambia ninguna decisión. El target, además, solo se observa al mes siguiente. Streaming agregaría costo (warehouse encendido, Kafka o Snowpipe Streaming) y complejidad (orden de eventos, estado y exactamente-una-vez) sin mejorar el resultado de negocio.</p>
+<p><b>Cuándo usaríamos streaming.</b> Si el caso de uso pasara de "quién no pagará el próximo mes" a "detectar el deterioro <i>dentro</i> del mes". Por ejemplo: scoring en cada transacción o pago para bajar el cupo en el momento, alertas el mismo día en que un cliente se sobregira o deja de pagar el mínimo, o detección de fraude. Eso exigiría eventos transaccionales (no estados de cuenta mensuales), una latencia de segundos o minutos con una acción automática asociada, y features calculadas en ventanas deslizantes (por ejemplo, el gasto de las últimas 24 h) en un <i>feature store</i> online.</p>
+
+<h2>7. Limitaciones</h2>
+<ul>
+<li><b>Fuente estática.</b> La partición mensual es una simulación sobre un archivo único de 2005. En producción, las corridas programadas terminan en <code>NO_PARTITION</code> (registrado, sin error); el schedule demuestra la automatización, pero no recibe datos nuevos.</li>
+<li><b>Codificación de PAY_STATUS.</b> La semántica de −2 y 0 proviene de aclaraciones del autor, no de la documentación oficial. El cambio de codificación del valor 1 entre meses no se puede corregir.</li>
+<li><b>Posible ruido en la etiqueta:</b> 795 cuentas inactivas con 37,6% de impago. Queda pendiente decidir en el modelado si se excluyen.</li>
+<li><b>Representatividad.</b> Son datos de Taiwán de 2005, en NT$, sin variables de buró ni de ingresos, y no reflejan a un banco ecuatoriano actual (riesgo ya identificado en el PSet 1).</li>
+<li><b>Arquitectura.</b> Cada mes del backfill dispara <code>pipeline_transform</code>, que queda en cola y re-ejecuta dbt y Spark seis veces. El resultado es correcto porque todo es idempotente, pero desperdicia cómputo; se podría resolver con un trigger al final del backfill. Spark corre en <code>local[*]</code> cuando lo lanza Kestra (el clúster se usa en la ejecución manual), y Silver/Gold se materializan como tablas completas, no incrementales, algo aceptable con 180.000 filas pero que habría que cambiar a escala bancaria.</li>
+<li><b>Verificación.</b> El pipeline completo (ingesta, dbt con 72/72 tests y Spark con las validaciones) se ejecutó de punta a punta sobre el destino local DuckDB con el mismo código SQL y Python. La ejecución contra Snowflake usa el perfil <code>prod</code> y el conector spark-snowflake.</li>
+</ul>
+
+<div class="pb"></div>
+<h2>Anexo A. Inventario de objetos en Snowflake</h2>
+<table>
+<tr><th>Esquema</th><th>Objeto</th><th>Tipo</th><th>Filas</th><th>Grano</th></tr>
+<tr><td rowspan="3">RAW</td><td>STATEMENTS</td><td>tabla</td><td>180.000</td><td>cliente × mes (partición <code>STATEMENT_MONTH</code>)</td></tr>
+<tr><td>CLIENTS_SNAPSHOT</td><td>tabla</td><td>180.000</td><td>cliente × snapshot mensual</td></tr>
+<tr><td>DEFAULT_LABELS</td><td>tabla</td><td>30.000</td><td>cliente (target de oct-2005)</td></tr>
+<tr><td>BRONZE</td><td>brz_statements, brz_clients_snapshot, brz_default_labels</td><td>vistas</td><td>= Raw</td><td>= Raw</td></tr>
+<tr><td>SILVER</td><td>slv_statements, slv_clients, slv_default_labels</td><td>tablas</td><td>180.000 / 30.000 / 30.000</td><td>cliente × mes / cliente / cliente</td></tr>
+<tr><td rowspan="2">GOLD</td><td>fct_monthly_statement, fct_default_outcome</td><td>tablas</td><td>180.000 / 30.000</td><td>cliente × mes / cliente × mes del target</td></tr>
+<tr><td>dim_customer, dim_month, dim_payment_status</td><td>tablas</td><td>30.000 / 7 / 12</td><td>—</td></tr>
+<tr><td>OBT</td><td>OBT_CUSTOMER_DEFAULT</td><td>tabla</td><td>30.000</td><td>cliente al cierre de sep-2005</td></tr>
+</table>
+
+<h2>Anexo B. Columnas de la OBT (53)</h2>
+<p><b>Identificación y cliente:</b> customer_key, customer_id, limit_bal, education_code, education, is_education_imputed, is_marriage_imputed, age, age_band, is_inactive_6m, months_with_credit_balance, attributes_as_of.
+<b>Historia mensual (m1 = sep … m6 = abr):</b> pay_status_m1..m6, bill_amt_m1..m6, pay_amt_m1..m6, util_m1..m6.
+<b>Agregados:</b> n_months_history, max_delay_6m, n_delinquent_months_6m, n_delinquent_months_3m, avg_utilization_6m, max_utilization_6m, avg_payment_ratio_6m, total_pay_amt_6m, avg_bill_amt_6m, n_overlimit_months_6m, n_credit_balance_months_6m, n_inconsistent_months_6m, bill_trend_m1_vs_m6, is_delinquent_last_month.
+<b>Target y tiempo:</b> observation_month_key, label_month_key, default_next_month.</p>
+<p>Chequeo de señal sobre la OBT (no es un modelo): los clientes sin atraso en 6 meses tienen 11,7% de impago; con un atraso máximo de 2 meses, 43,6%; con 3 meses, 62,2%. La regla baseline del PSet 1 (atraso ≥ 1 en el último mes) es reproducible directamente con <code>is_delinquent_last_month</code>.</p>
+
+<h2>Anexo C. Pruebas dbt</h2>
+<table>
+<tr><th>Capa</th><th>Tests</th></tr>
+<tr><td>Sources (Raw)</td><td>not_null de ID y de la partición; accepted_values de <code>STATEMENT_MONTH</code> (abr–sep 2005); unique de ID en etiquetas.</td></tr>
+<tr><td>Bronze</td><td>not_null; <code>pay_amt ≥ 0</code>; unique de las etiquetas; target ∈ {0,1}.</td></tr>
+<tr><td>Silver</td><td>unique/not_null de <code>customer_id</code>; sin pérdida de clientes (<code>row_count_equals_model</code>); cupo &gt; 0; edad entre 18 y 100; education ∈ {1..4}; marriage ∈ {1..3}; sex ∈ {1,2}; pay_status ∈ {−2..9}; months_delay entre 0 y 9; relationships con slv_clients.</td></tr>
+<tr><td>Gold</td><td>PK unique/not_null en las 3 dimensiones; relationships de los dos hechos con sus 3 dimensiones; conteos de hechos = Silver; target not_null ∈ {0,1}; months_to_label entre 0 y 6.</td></tr>
+<tr><td>Singulares (negocio)</td><td><code>assert_fct_statement_grain_unique</code>, <code>assert_six_months_per_customer</code>, <code>assert_no_target_before_observation</code> (anti-fuga), <code>assert_default_rate_plausible</code>, <code>assert_delinquent_matches_status</code>.</td></tr>
+</table>
+
+<h2>Anexo D. Ejecución</h2>
+<pre>cp .env.example .env &amp;&amp; ./scripts/encode_secrets.sh   # credenciales (no versionadas)
+docker compose up -d                                  # Kestra, Postgres, Spark
+./scripts/deploy_kestra.sh                            # namespace files + flujos
+# Kestra UI → usfq.pset2.uci_backfill → Execute       # Raw (abr–sep 2005)
+#   → pipeline_transform se dispara solo: dbt build → spark-submit build_obt.py
+# Ejecución manual de dbt y Spark: ver README.md</pre>
+</body></html>

@@ -1,0 +1,29 @@
+version: 2
+
+sources:
+  - name: raw
+    description: Datos originales cargados por Kestra (uci_ingest_monthly), sin transformar.
+    schema: RAW
+    tables:
+      - name: CLIENTS_SNAPSHOT
+        description: Atributos del cliente; una copia completa por cada mes cargado.
+        columns:
+          - name: ID
+            tests: [not_null]
+          - name: SNAPSHOT_MONTH
+            tests: [not_null]
+      - name: STATEMENTS
+        description: Estado de cuenta mensual, una fila por cliente y mes (abr-sep 2005).
+        columns:
+          - name: ID
+            tests: [not_null]
+          - name: STATEMENT_MONTH
+            tests:
+              - not_null
+              - accepted_values:
+                  values: ['2005-04','2005-05','2005-06','2005-07','2005-08','2005-09']
+      - name: DEFAULT_LABELS
+        description: Target (impago en oct-2005), disponible solo tras el cierre de sep-2005.
+        columns:
+          - name: ID
+            tests: [not_null, unique]

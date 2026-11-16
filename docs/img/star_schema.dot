@@ -1,0 +1,30 @@
+digraph S {
+  rankdir=LR; fontname="Helvetica"; nodesep=0.3; ranksep=0.7;
+  node [fontname="Helvetica", fontsize=10, shape=plain];
+  edge [color="#5b6b7b", arrowhead=none];
+
+  fct [label=<<table border="0" cellborder="1" cellspacing="0" cellpadding="4" bgcolor="#fde7d4">
+    <tr><td bgcolor="#f59e57"><b>fct_monthly_statement</b><br/><font point-size="9">grano: cliente × mes (180.000)</font></td></tr>
+    <tr><td align="left">customer_key (FK)<br/>month_key (FK)<br/>payment_status_key (FK)<br/>customer_id (degenerada)</td></tr>
+    <tr><td align="left">bill_amt · pay_amt · prev_bill_amt<br/>months_delay · is_delinquent<br/>utilization_ratio · payment_ratio<br/>has_credit_balance · is_overlimit<br/>flag_delay_without_balance<br/>flag_no_use_with_balance</td></tr></table>>];
+
+  out [label=<<table border="0" cellborder="1" cellspacing="0" cellpadding="4" bgcolor="#fde7d4">
+    <tr><td bgcolor="#f59e57"><b>fct_default_outcome</b><br/><font point-size="9">grano: cliente × mes del target (30.000)</font></td></tr>
+    <tr><td align="left">customer_key (FK)<br/>label_month_key (FK) = 200510<br/>observation_month_key = 200509</td></tr>
+    <tr><td align="left">default_next_month (0/1)</td></tr></table>>];
+
+  cust [label=<<table border="0" cellborder="1" cellspacing="0" cellpadding="4" bgcolor="#e0ecff">
+    <tr><td bgcolor="#7aa7e8"><b>dim_customer</b> (SCD1)</td></tr>
+    <tr><td align="left">customer_key (PK, md5)<br/>customer_id · limit_bal<br/>education · age · age_band<br/>is_education_imputed<br/>is_inactive_6m<br/><i>sex, marital_status (solo auditoría)</i></td></tr></table>>];
+
+  month [label=<<table border="0" cellborder="1" cellspacing="0" cellpadding="4" bgcolor="#e0ecff">
+    <tr><td bgcolor="#7aa7e8"><b>dim_month</b></td></tr>
+    <tr><td align="left">month_key (PK, yyyymm)<br/>month_start · year · quarter<br/>month_name · months_to_label<br/>is_label_month</td></tr></table>>];
+
+  st [label=<<table border="0" cellborder="1" cellspacing="0" cellpadding="4" bgcolor="#e0ecff">
+    <tr><td bgcolor="#7aa7e8"><b>dim_payment_status</b></td></tr>
+    <tr><td align="left">payment_status_key (PK, −2…9)<br/>status_group · description<br/>is_delinquent · delay_bucket</td></tr></table>>];
+
+  cust -> fct; month -> fct; st -> fct;
+  cust -> out; month -> out;
+}

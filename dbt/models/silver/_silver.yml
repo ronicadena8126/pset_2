@@ -1,0 +1,57 @@
+version: 2
+models:
+  - name: slv_clients
+    description: Un registro por cliente (snapshot más reciente) con categorías limpias.
+    tests:
+      - row_count_equals_model:
+          compare_model: ref('brz_clients_snapshot')
+          compare_expression: "count(distinct customer_id)"
+    columns:
+      - name: customer_id
+        tests: [not_null, unique]
+      - name: limit_bal
+        tests:
+          - not_null
+          - expression_is_true:
+              expression: "limit_bal > 0"
+      - name: age
+        tests:
+          - expression_is_true:
+              expression: "age between 18 and 100"
+      - name: education_code
+        tests:
+          - accepted_values: {values: [1, 2, 3, 4], quote: false}
+      - name: marriage_code
+        tests:
+          - accepted_values: {values: [1, 2, 3], quote: false}
+      - name: sex_code
+        tests:
+          - accepted_values: {values: [1, 2], quote: false}
+
+  - name: slv_statements
+    description: Estados de cuenta limpios, grano cliente x mes.
+    columns:
+      - name: customer_id
+        tests:
+          - not_null
+          - relationships: {to: ref('slv_clients'), field: customer_id}
+      - name: pay_status
+        tests:
+          - accepted_values: {values: [-2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9], quote: false}
+      - name: pay_amt
+        tests:
+          - expression_is_true: {expression: "pay_amt >= 0"}
+      - name: months_delay
+        tests:
+          - expression_is_true: {expression: "months_delay between 0 and 9"}
+
+  - name: slv_default_labels
+    columns:
+      - name: customer_id
+        tests:
+          - not_null
+          - unique
+          - relationships: {to: ref('slv_clients'), field: customer_id}
+      - name: default_next_month
+        tests:
+          - accepted_values: {values: [0, 1], quote: false}

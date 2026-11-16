@@ -1,0 +1,11 @@
+.env
+.env_encoded
+*.duckdb
+dbt/target/
+dbt/logs/
+dbt/dbt_packages/
+spark/gold_parquet/
+__pycache__/
+.ivy*/
+*.xls
+.venv/

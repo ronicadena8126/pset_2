@@ -1,0 +1,28 @@
+digraph G {
+  rankdir=LR; fontname="Helvetica"; nodesep=0.25; ranksep=0.35; newrank=true;
+  node [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", fillcolor="#ffffff", color="#5b6b7b"];
+  edge [fontname="Helvetica", fontsize=8, color="#5b6b7b"];
+
+  src [label="Fuente UCI\n(.xls, 30.000 clientes,\nabr–sep 2005)", fillcolor="#f3f4f6"];
+  kes [label="Kestra\nuci_ingest_monthly\nSchedule día 2 06:00\nretry exp. ×4 · errors\nuci_backfill (ForEach)", fillcolor="#e0ecff"];
+  raw [label="RAW\nCLIENTS_SNAPSHOT\nSTATEMENTS\nDEFAULT_LABELS"];
+  brz [label="BRONZE\nvistas tipadas"];
+  slv [label="SILVER\nlimpieza +\nbanderas"];
+  gld [label="GOLD\nestrella\n2 hechos · 3 dim."];
+  spk [label="Spark 3.4\nbuild_obt.py\n(pivot + validación)", fillcolor="#e3f4e1"];
+  obt [label="OBT\nOBT_CUSTOMER_DEFAULT\n1 fila / cliente"];
+  dbt [label="dbt Core (dbt-snowflake)\nsource() / ref() · build = modelos + tests", fillcolor="#fde7d4"];
+  trf [label="Kestra pipeline_transform\n(Flow trigger: ingesta SUCCESS)\n→ dbt build → spark-submit", fillcolor="#e0ecff"];
+
+  src -> kes [label="HTTP"];
+  kes -> raw [label="DELETE+INSERT\npor mes"];
+  raw -> brz -> slv -> gld;
+  gld -> spk -> obt;
+  dbt -> brz [style=dashed, arrowhead=none]; dbt -> slv [style=dashed, arrowhead=none]; dbt -> gld [style=dashed, arrowhead=none];
+  trf -> dbt [style=dotted]; trf -> spk [style=dotted];
+  kes -> trf [style=dotted, label="SUCCESS"];
+
+  subgraph cluster_sf { label="Snowflake · PSET2_MORA"; style="rounded,filled"; fillcolor="#eef7fb"; color="#7dbad6"; raw; brz; slv; gld; obt; }
+  { rank=same; kes; trf; }
+  { rank=same; brz; dbt; }
+}

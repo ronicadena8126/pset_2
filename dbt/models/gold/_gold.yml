@@ -1,0 +1,66 @@
+version: 2
+models:
+  - name: dim_customer
+    description: Dimensión cliente (SCD1). sex y marital_status solo para auditoría de equidad.
+    tests:
+      - row_count_equals_model:
+          compare_model: ref('slv_clients')
+    columns:
+      - name: customer_key
+        tests: [not_null, unique]
+      - name: customer_id
+        tests: [not_null, unique]
+
+  - name: dim_month
+    columns:
+      - name: month_key
+        tests: [not_null, unique]
+      - name: months_to_label
+        tests:
+          - expression_is_true: {expression: "months_to_label between 0 and 6"}
+
+  - name: dim_payment_status
+    columns:
+      - name: payment_status_key
+        tests: [not_null, unique]
+
+  - name: fct_monthly_statement
+    description: "Grano: un estado de cuenta por cliente y mes."
+    tests:
+      - row_count_equals_model:
+          compare_model: ref('slv_statements')
+    columns:
+      - name: customer_key
+        tests:
+          - not_null
+          - relationships: {to: ref('dim_customer'), field: customer_key}
+      - name: month_key
+        tests:
+          - not_null
+          - relationships: {to: ref('dim_month'), field: month_key}
+      - name: payment_status_key
+        tests:
+          - not_null
+          - relationships: {to: ref('dim_payment_status'), field: payment_status_key}
+      - name: utilization_ratio
+        tests:
+          - not_null   # limit_bal > 0 siempre (validado en Silver)
+
+  - name: fct_default_outcome
+    description: "Grano: un cliente por mes de target (oct-2005)."
+    tests:
+      - row_count_equals_model:
+          compare_model: ref('dim_customer')
+    columns:
+      - name: customer_key
+        tests:
+          - not_null
+          - unique
+          - relationships: {to: ref('dim_customer'), field: customer_key}
+      - name: label_month_key
+        tests:
+          - relationships: {to: ref('dim_month'), field: month_key}
+      - name: default_next_month
+        tests:
+          - not_null
+          - accepted_values: {values: [0, 1], quote: false}

@@ -1,0 +1,88 @@
+id: uci_ingest_monthly
+namespace: usfq.pset2
+description: |
+  Ingesta mensual de la fuente UCI Default of Credit Card Clients hacia Snowflake (esquema RAW).
+  Cada ejecución carga UNA partición mensual (estado de cuenta) de forma idempotente
+  (DELETE de la partición + INSERT). Se ejecuta sola por Schedule y se re-ejecuta sin
+  duplicar datos en retries y backfills.
+
+labels:
+  project: anticipar-mora
+  layer: raw
+
+# Nunca dos cargas a la vez: evita condiciones de carrera sobre la misma partición
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: statement_month
+    type: STRING
+    required: false
+    description: >
+      Mes del estado de cuenta a cargar (YYYY-MM). Si se omite, se carga el mes anterior
+      a la fecha programada (trigger.date). El backfill lo pasa explícitamente.
+    validator: "^\\d{4}-\\d{2}$"
+
+variables:
+  statement_month: "{{ inputs.statement_month ?? ((trigger.date ?? execution.startDate) | dateAdd(-1, 'MONTHS') | date('yyyy-MM')) }}"
+
+tasks:
+  - id: ingest_partition
+    type: io.kestra.plugin.scripts.python.Commands
+    description: Descarga la fuente, extrae la partición mensual y la carga en RAW
+    # Corre la imagen del proyecto (Dockerfile en la raíz): docker build -t pset2-ingesta:1.0 .
+    # Si cambia el Dockerfile, se sube el tag aquí y en el README.
+    containerImage: pset2-ingesta:1.0
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      pullPolicy: NEVER
+    env:
+      SNOWFLAKE_ACCOUNT: "{{ secret('SNOWFLAKE_ACCOUNT') }}"
+      SNOWFLAKE_USER: "{{ secret('SNOWFLAKE_USER') }}"
+      SNOWFLAKE_PASSWORD: "{{ secret('SNOWFLAKE_PASSWORD') }}"
+      SNOWFLAKE_ROLE: "{{ secret('SNOWFLAKE_ROLE') }}"
+      SNOWFLAKE_WAREHOUSE: "{{ secret('SNOWFLAKE_WAREHOUSE') }}"
+      SNOWFLAKE_DATABASE: "{{ secret('SNOWFLAKE_DATABASE') }}"
+      RAW_SCHEMA: RAW
+      KESTRA_EXECUTION_ID: "{{ execution.id }}"
+    commands:
+      - python /app/ingest_uci.py --statement-month {{ render(vars.statement_month) }} --target snowflake
+    timeout: PT20M
+    # Por qué así: la fuente es un archivo estático en el servidor de UCI, que falla por
+    # caídas o throttling HTTP de minutos, no de segundos; y Snowflake puede tardar en
+    # reanudar el warehouse suspendido (AUTO_SUSPEND=60). Por eso espera exponencial:
+    # 30s -> 1m -> 2m -> 4m (4 intentos, tope 10 min, máximo 1 h). Un reintento
+    # inmediato (constant 5s) golpearía la misma caída. Como la carga es idempotente,
+    # reintentar nunca duplica filas.
+    retry:
+      type: exponential
+      interval: PT30S
+      maxInterval: PT10M
+      maxAttempts: 4
+      maxDuration: PT1H
+      warningOnRetry: true
+
+  - id: log_result
+    type: io.kestra.plugin.core.log.Log
+    message: "Partición {{ render(vars.statement_month) }} -> {{ outputs.ingest_partition.vars }}"
+
+# Se ejecuta solo si falla alguna tarea después de agotar los retries
+errors:
+  - id: log_failure
+    type: io.kestra.plugin.core.log.Log
+    level: ERROR
+    message: >
+      FALLÓ la ingesta de la partición {{ render(vars.statement_month) }}.
+      Execution {{ execution.id }}. Revisar logs de ingest_partition; la partición
+      queda sin cambios porque la carga es transaccional (DELETE+INSERT en un COMMIT).
+
+triggers:
+  # Por qué mensual: la fuente cambia una vez al mes (cierre del estado de cuenta) y la
+  # decisión de cobranza también es mensual. Correr a diario repetiría la misma partición.
+  # Día 2 a las 06:00 (Ecuador): da un día de margen al cierre del core y deja la lista
+  # lista antes de la jornada de cobranza.
+  - id: monthly_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 6 2 * *"
+    timezone: America/Guayaquil

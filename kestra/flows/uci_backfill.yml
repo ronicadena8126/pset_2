@@ -1,0 +1,43 @@
+id: uci_backfill
+namespace: usfq.pset2
+description: |
+  Backfill de la historia disponible (abril-septiembre 2005). Recorre los meses en orden
+  cronológico y llama al flujo de ingesta mensual para cada uno, de a uno por vez.
+  Como la ingesta es idempotente, el backfill se puede repetir completo o para un solo mes
+  sin duplicar datos.
+
+labels:
+  project: anticipar-mora
+  layer: raw
+
+inputs:
+  - id: months
+    type: ARRAY
+    itemType: STRING
+    description: Meses a (re)cargar, YYYY-MM
+    defaults:
+      - "2005-04"
+      - "2005-05"
+      - "2005-06"
+      - "2005-07"
+      - "2005-08"
+      - "2005-09"
+
+tasks:
+  - id: for_each_month
+    type: io.kestra.plugin.core.flow.ForEach
+    values: "{{ inputs.months }}"
+    concurrencyLimit: 1   # secuencial: respeta el orden cronológico
+    tasks:
+      - id: load_month
+        type: io.kestra.plugin.core.flow.Subflow
+        namespace: usfq.pset2
+        flowId: uci_ingest_monthly
+        inputs:
+          statement_month: "{{ taskrun.value }}"
+        wait: true
+        transmitFailed: true   # si un mes falla, el backfill falla y se ve qué mes
+
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: "Backfill terminado para {{ inputs.months | length }} meses: {{ inputs.months }}"

@@ -1,0 +1,21 @@
+# Las credenciales se leen de variables de entorno (.env); nunca se versionan.
+pset2_mora:
+  target: prod
+  outputs:
+    prod:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      # key-pair (recomendado: Snowflake bloquea usuarios de servicio solo con contraseña)
+      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE', 'TRANSFORMER') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE') }}"
+      database: "{{ env_var('SNOWFLAKE_DATABASE') }}"
+      schema: PUBLIC
+      threads: 4
+    # Destino local (DuckDB) para probar el proyecto sin consumir créditos de Snowflake
+    local:
+      type: duckdb
+      path: "{{ env_var('DUCKDB_PATH', 'local.duckdb') }}"
+      schema: main
+      threads: 4

@@ -1,0 +1,25 @@
+version: 2
+models:
+  - name: brz_clients_snapshot
+    description: Atributos de cliente tipados (180.000 filas = 30.000 clientes x 6 snapshots).
+    columns:
+      - name: customer_id
+        tests: [not_null]
+  - name: brz_statements
+    description: Estados de cuenta tipados (cliente x mes).
+    columns:
+      - name: customer_id
+        tests: [not_null]
+      - name: pay_amt
+        tests:
+          - expression_is_true:
+              expression: "pay_amt >= 0"
+  - name: brz_default_labels
+    columns:
+      - name: customer_id
+        tests: [not_null, unique]
+      - name: default_next_month
+        tests:
+          - accepted_values:
+              values: [0, 1]
+              quote: false

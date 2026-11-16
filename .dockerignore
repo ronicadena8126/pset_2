@@ -1,0 +1,6 @@
+.env
+.env_encoded
+*.duckdb
+dbt/target/
+spark/gold_parquet/
+docs/
