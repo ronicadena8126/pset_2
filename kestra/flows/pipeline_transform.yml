@@ -1,38 +1,39 @@
 id: pipeline_transform
 namespace: usfq.pset2
 description: |
-  Transformación posterior a la ingesta: dbt (Bronze -> Silver -> Gold + tests) y Spark (OBT).
-  Se dispara automáticamente cuando uci_ingest_monthly o uci_backfill terminan con SUCCESS.
-  Si un test de dbt falla, Spark no corre: la OBT nunca se construye sobre datos que no pasaron calidad.
-
+  Transformación posterior a la ingesta: dbt build (Bronze -> Silver -> Gold + 72 tests) y
+  Spark (OBT). Si un test de dbt falla, Spark no corre: la OBT nunca se construye sobre datos
+  que no pasaron calidad. Corre el día 2 a las 07:00, una hora después de la ingesta mensual
+  (06:00), y también se puede lanzar a mano después del backfill.
 labels:
   project: anticipar-mora
   layer: transform
-
 concurrency:
   limit: 1
   behavior: QUEUE
-
 tasks:
   - id: dbt_build
-    type: io.kestra.plugin.dbt.cli.DbtCLI
-    description: dbt build = run + test en orden de dependencias (source -> ref)
+    type: io.kestra.plugin.scripts.shell.Commands
+    containerImage: pset2-transform:1.0
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      pullPolicy: NEVER
     namespaceFiles:
       enabled: true
       include:
         - dbt/**
-    taskRunner:
-      type: io.kestra.plugin.scripts.runner.docker.Docker
-    containerImage: ghcr.io/kestra-io/dbt-snowflake:latest
     env:
       SNOWFLAKE_ACCOUNT: "{{ secret('SNOWFLAKE_ACCOUNT') }}"
       SNOWFLAKE_USER: "{{ secret('SNOWFLAKE_USER') }}"
-      SNOWFLAKE_PASSWORD: "{{ secret('SNOWFLAKE_PASSWORD') }}"
+      SNOWFLAKE_PRIVATE_KEY: "{{ secret('SNOWFLAKE_PRIVATE_KEY') }}"
+      SNOWFLAKE_PRIVATE_KEY_PATH: /tmp/sf_key.p8
       SNOWFLAKE_ROLE: "{{ secret('SNOWFLAKE_ROLE') }}"
       SNOWFLAKE_WAREHOUSE: "{{ secret('SNOWFLAKE_WAREHOUSE') }}"
       SNOWFLAKE_DATABASE: "{{ secret('SNOWFLAKE_DATABASE') }}"
     commands:
+      - printf '%s\n' "$SNOWFLAKE_PRIVATE_KEY" > /tmp/sf_key.p8
       - dbt build --project-dir dbt --profiles-dir dbt --target prod
+    timeout: PT30M
     retry:
       type: constant
       interval: PT1M
@@ -40,29 +41,27 @@ tasks:
 
   - id: spark_obt
     type: io.kestra.plugin.scripts.shell.Commands
-    description: Construye la OBT con Spark desde Gold y la escribe en Snowflake
+    containerImage: pset2-transform:1.0
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      pullPolicy: NEVER
     namespaceFiles:
       enabled: true
       include:
         - spark/build_obt.py
-    taskRunner:
-      type: io.kestra.plugin.scripts.runner.docker.Docker
-      networkMode: pset2_net
-    containerImage: apache/spark:3.4.1
+        - kestra/scripts/ingest_uci.py
     env:
       SNOWFLAKE_ACCOUNT: "{{ secret('SNOWFLAKE_ACCOUNT') }}"
       SNOWFLAKE_USER: "{{ secret('SNOWFLAKE_USER') }}"
-      SNOWFLAKE_PASSWORD: "{{ secret('SNOWFLAKE_PASSWORD') }}"
+      SNOWFLAKE_PRIVATE_KEY: "{{ secret('SNOWFLAKE_PRIVATE_KEY') }}"
+      SNOWFLAKE_PRIVATE_KEY_PATH: /tmp/sf_key.p8
       SNOWFLAKE_ROLE: "{{ secret('SNOWFLAKE_ROLE') }}"
       SNOWFLAKE_WAREHOUSE: "{{ secret('SNOWFLAKE_WAREHOUSE') }}"
       SNOWFLAKE_DATABASE: "{{ secret('SNOWFLAKE_DATABASE') }}"
     commands:
-      - >
-        /opt/spark/bin/spark-submit
-        --master local[*]
-        --conf spark.jars.ivy=/tmp/.ivy
-        --packages net.snowflake:spark-snowflake_2.12:2.16.0-spark_3.4,net.snowflake:snowflake-jdbc:3.16.1
-        spark/build_obt.py --mode snowflake
+      - printf '%s\n' "$SNOWFLAKE_PRIVATE_KEY" > /tmp/sf_key.p8
+      - python spark/build_obt.py --mode snowflake-py
+    timeout: PT30M
     retry:
       type: constant
       interval: PT2M
@@ -74,3 +73,8 @@ errors:
     level: ERROR
     message: "FALLÓ la transformación (execution {{ execution.id }}). Revisar dbt_build / spark_obt."
 
+triggers:
+  - id: monthly_after_ingest
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 7 2 * *"
+    timezone: America/Guayaquil

@@ -16,6 +16,7 @@ upload() {  # $1 = ruta local, $2 = ruta en el namespace
 
 echo "Subiendo namespace files..."
 upload kestra/scripts/ingest_uci.py scripts/ingest_uci.py
+upload kestra/scripts/ingest_uci.py kestra/scripts/ingest_uci.py
 upload spark/build_obt.py spark/build_obt.py
 find dbt -type f \( -name '*.sql' -o -name '*.yml' \) -not -path 'dbt/target/*' -not -path 'dbt/logs/*' |
   while read -r f; do upload "$f" "$f"; done

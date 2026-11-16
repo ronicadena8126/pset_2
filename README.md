@@ -21,6 +21,7 @@ UCI (.xls) → Kestra → RAW → dbt → BRONZE → dbt → SILVER → dbt → 
 pset_2/
 ├── docker-compose.yml        Kestra + Postgres, Spark master/worker, dbt (perfil "tools")
 ├── Dockerfile                imagen de la ingesta (pset2-ingesta:1.0) que corre Kestra
+├── Dockerfile.transform      imagen de dbt + Spark (pset2-transform:1.0)
 ├── requirements.txt          librerías de esa imagen
 ├── .env.example              variables necesarias (copiar a .env)
 ├── kestra/
@@ -34,37 +35,45 @@ pset_2/
 
 ## Requisitos
 
-- El Codespace del curso (o Docker Desktop, Java 17 y Python 3.11). **Usa una máquina de 4 núcleos**, porque Kestra y Spark corren al mismo tiempo. Las UIs se abren desde la pestaña **Ports** de VS Code.
-- Una cuenta de Snowflake (sirve la de prueba gratuita)
-- `curl` y `bash`
+- Docker Desktop (o el Codespace del curso con una máquina de **4 núcleos**). Las UIs se abren desde la pestaña **Ports**.
+- Python **3.11** para correr dbt/Spark fuera de Docker (Python 3.12+ no es compatible con pyspark 3.5). Con `uv`: `uv venv -p 3.11 .venv`.
+- Una cuenta de Snowflake (sirve la de prueba gratuita) y `openssl`, `curl`, `bash`.
 
 Relación con las capas vistas en clase: Bronze equivale a la copia tipada de RAW, Silver a *staging* (la limpieza) y Gold a los *marts* (el esquema estrella).
 
-## 1. Preparar Snowflake
+## 1. Preparar Snowflake (autenticación key-pair)
 
-Ejecuta `docs/snowflake_setup.sql` en un worksheet de Snowflake. Crea el warehouse `PSET2_WH`, la base `PSET2_MORA`, los esquemas `RAW`, `BRONZE`, `SILVER`, `GOLD` y `OBT`, y el rol y el usuario de servicio.
+Snowflake no admite usuarios de servicio que entren solo con contraseña, así que el pipeline usa key-pair:
+
+```bash
+mkdir -p ~/.snowflake
+openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -out ~/.snowflake/pset2_rsa_key.p8 -nocrypt
+chmod 600 ~/.snowflake/pset2_rsa_key.p8
+openssl rsa -in ~/.snowflake/pset2_rsa_key.p8 -pubout 2>/dev/null | grep -v 'PUBLIC KEY' | tr -d '\n'   # llave pública
+```
+
+Abre `docs/snowflake_setup.sql`, reemplaza `<PEGA_AQUI_TU_LLAVE_PUBLICA>` por la llave pública y ejecútalo completo (**Run All**) como `ACCOUNTADMIN`. Crea el warehouse, la base `PSET2_MORA`, los esquemas `RAW`/`BRONZE`/`SILVER`/`GOLD`/`OBT`, el rol `PSET2_ROLE` y el usuario de servicio `PSET2_SVC`.
 
 ## 2. Configurar credenciales
 
 ```bash
-cp .env.example .env            # completar con tus valores
-./scripts/encode_secrets.sh     # genera .env_encoded (SECRET_* en base64 para Kestra)
+cp .env.example .env                 # completa SNOWFLAKE_ACCOUNT (orgname-accountname) y la ruta ABSOLUTA de la llave
+bash scripts/encode_secrets.sh       # genera .env_encoded: SECRET_* en base64 para Kestra, incluida la llave privada
 ```
 
-Ni `.env` ni `.env_encoded` se versionan (están en `.gitignore`). Los flujos leen las credenciales con `{{ secret('SNOWFLAKE_...') }}`.
+Ni `.env` ni `.env_encoded` ni la llave se versionan (`.gitignore`). Los flujos leen todo con `{{ secret('SNOWFLAKE_...') }}`, y cada contenedor escribe la llave en `/tmp/sf_key.p8`.
 
-## 3. Construir la imagen de ingesta y levantar la infraestructura
+## 3. Construir las imágenes y levantar Kestra
 
 ```bash
-docker build -t pset2-ingesta:1.0 .     # la imagen que corre Kestra (pullPolicy: NEVER)
-docker compose up -d                    # postgres, kestra (v2.0.7), spark-master, spark-worker
-docker compose ps
+docker build -t pset2-ingesta:1.0 .                                  # ingesta (Kestra la corre con pullPolicy: NEVER)
+docker build -f Dockerfile.transform -t pset2-transform:1.0 .        # dbt + Spark (Java 17)
+docker compose up -d postgres kestra                                 # Kestra v2.0.7 + Postgres
 ```
 
-Si cambias el `Dockerfile` o `ingest_uci.py`, reconstruye la imagen con un tag nuevo y actualiza `containerImage` en `kestra/flows/uci_ingest_monthly.yml`.
+UI de Kestra: http://localhost:8080 (`admin@kestra.io` / `Admin1234`, como en el lab de la Semana 4). Si cambias `.env_encoded`, recrea Kestra con `docker compose up -d --force-recreate kestra`.
 
-- UI de Kestra: http://localhost:8080 (por defecto `admin@kestra.io` / `Admin1234`, como en el lab de la Semana 4)
-- UI de Spark: http://localhost:8082
+Spark corre dentro de `pset2-transform` en modo local. `spark-master` y `spark-worker` del compose son opcionales; levántalos con `docker compose up -d spark-master spark-worker` si quieres usar el clúster.
 
 ## 4. Publicar flujos y archivos en Kestra
 
@@ -72,47 +81,37 @@ Si cambias el `Dockerfile` o `ingest_uci.py`, reconstruye la imagen con un tag n
 bash scripts/deploy_kestra.sh
 ```
 
-Sigue el mismo patrón que `subir_a_kestra.sh` del laboratorio: sube el proyecto dbt y el job de Spark como *namespace files* de `usfq.pset2`, y crea o actualiza los tres flujos.
+Sube el proyecto dbt, el job de Spark y el script de ingesta como *namespace files* de `usfq.pset2`, y crea o actualiza los tres flujos.
 
 ## 5. Ejecutar el pipeline
 
-### Ingesta: backfill histórico (primera vez)
+| Orden | Flujo | Qué hace | Resultado esperado |
+|---|---|---|---|
+| 1 | `uci_backfill` | Carga abr–sep 2005 a RAW, mes a mes e idempotente | SUCCESS; 180.000 filas en `RAW.STATEMENTS` |
+| 2 | `pipeline_transform` | `dbt build` (Bronze → Silver → Gold + tests) y después Spark (OBT) | SUCCESS; `PASS=72`; 30.000 filas en `OBT.OBT_CUSTOMER_DEFAULT` |
 
-En la UI de Kestra: **Flows → usfq.pset2 → uci_backfill → Execute**. Por defecto carga abr–sep 2005, un mes por vez.
+En la UI: **Flows → usfq.pset2 → (flujo) → Execute**.
 
-O por API:
+**Programación:** `uci_ingest_monthly` corre el día 2 de cada mes a las 06:00 (America/Guayaquil) y carga el mes anterior, con 4 retries exponenciales (30 s a 10 min). `pipeline_transform` corre el mismo día a las 07:00. Si un test de dbt falla, Spark no corre. Como la fuente es estática, una corrida programada fuera de abr–sep 2005 termina en `NO_PARTITION` sin cargar nada.
 
-```bash
-curl -u admin@kestra.io:Admin1234 -X POST \
-  http://localhost:8080/api/v1/main/executions/usfq.pset2/uci_backfill
-```
-
-Para recargar un solo mes, ejecuta `uci_ingest_monthly` con el input `statement_month=2005-07`. La carga es idempotente: borra e inserta la partición dentro de una transacción.
-
-### Ingesta programada
-
-`uci_ingest_monthly` corre sola el día 2 de cada mes a las 06:00 (America/Guayaquil) y carga el mes anterior. Tiene 4 retries exponenciales (30 s a 10 min) y un bloque `errors`. Como la fuente es estática, una corrida programada fuera de abr–sep 2005 termina en estado `NO_PARTITION`, sin cargar nada.
-
-### Transformación (dbt + Spark)
-
-`pipeline_transform` se dispara automáticamente cuando `uci_ingest_monthly` termina en SUCCESS. Ejecuta `dbt build` (modelos + tests) y después el job de Spark. Si algún test falla, Spark no corre.
-
-### Ejecución manual de cada herramienta
+### Ejecución sin Kestra (opcional, desde tu máquina)
 
 ```bash
-# dbt (modelos + tests) contra Snowflake
-docker compose run --rm dbt build --target prod
-docker compose run --rm dbt docs generate --target prod
-
-# Spark sobre el cluster local, leyendo GOLD y escribiendo OBT en Snowflake
-docker compose exec spark-master /opt/spark/bin/spark-submit \
-  --master spark://spark-master:7077 \
-  --conf spark.jars.ivy=/tmp/.ivy \
-  --packages net.snowflake:spark-snowflake_2.12:2.16.0-spark_3.4,net.snowflake:snowflake-jdbc:3.16.1 \
-  /opt/spark-apps/build_obt.py --mode snowflake
+uv venv -p 3.11 .venv && source .venv/bin/activate
+uv pip install pandas==2.2.2 pyarrow==16.1.0 xlrd requests "snowflake-connector-python[pandas]" dbt-snowflake pyspark==3.5.3
+set -a; source .env; set +a
+for m in 2005-04 2005-05 2005-06 2005-07 2005-08 2005-09; do
+  python kestra/scripts/ingest_uci.py --statement-month $m --target snowflake --local-file default_of_credit_card_clients.xls
+done
+dbt build --project-dir dbt --profiles-dir dbt --target prod
+# En Mac con VPN o proxy, fuerza que Spark use localhost:
+export SPARK_LOCAL_IP=127.0.0.1
+export PYSPARK_SUBMIT_ARGS="--conf spark.driver.host=127.0.0.1 --conf spark.driver.bindAddress=127.0.0.1 --conf spark.ui.enabled=false pyspark-shell"
+python spark/build_obt.py --mode snowflake-py
 ```
 
-El job imprime las validaciones (`[validation] ...`) y solo escribe la OBT si todas pasan.
+El archivo fuente se descarga con:
+`curl -L -o default_of_credit_card_clients.xls https://raw.githubusercontent.com/jphall663/interpretable_machine_learning_with_python/master/default_of_credit_card_clients.xls`
 
 ## Prueba local sin Snowflake (opcional)
 

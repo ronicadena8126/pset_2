@@ -32,7 +32,7 @@ tasks:
       SNOWFLAKE_DATABASE: "{{ secret('SNOWFLAKE_DATABASE') }}"
     commands:
       - printf '%s\n' "$SNOWFLAKE_PRIVATE_KEY" > /tmp/sf_key.p8
-      - curl -sL -o /tmp/uci.xls https://raw.githubusercontent.com/jphall663/interpretable_machine_learning_with_python/master/default_of_credit_card_clients.xls || python -c "import requests;open('/tmp/uci.xls','wb').write(requests.get('https://raw.githubusercontent.com/jphall663/interpretable_machine_learning_with_python/master/default_of_credit_card_clients.xls').content)"
+      - python -c "import requests;open('/tmp/uci.xls','wb').write(requests.get('https://raw.githubusercontent.com/jphall663/interpretable_machine_learning_with_python/master/default_of_credit_card_clients.xls',timeout=120).content)"
       - for m in {{ inputs.months }}; do python /app/ingest_uci.py --statement-month $m --target snowflake --local-file /tmp/uci.xls --execution-id {{ execution.id }} || exit 1; done
     timeout: PT30M
     retry:
